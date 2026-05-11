@@ -1,0 +1,63 @@
+{
+  "name": "lavish-axi",
+  "version": "0.1.0",
+  "description": "HTML is the new markdown. Lavish is the new editor for your HTML artifacts.",
+  "type": "module",
+  "bin": {
+    "lavish-axi": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "start": "node dist/cli.mjs",
+    "lint": "eslint bin src test scripts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepack": "npm run build",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "axi-sdk-js": "^0.1.5",
+    "chokidar": "^4.0.3",
+    "express": "^5.2.1",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.6.2",
+    "esbuild": "^0.28.0",
+    "eslint": "^10.3.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "axi",
+    "agent",
+    "cli",
+    "html",
+    "review",
+    "collaboration"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kunchenguid/lavish.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kunchenguid/lavish/issues"
+  },
+  "homepage": "https://github.com/kunchenguid/lavish#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
