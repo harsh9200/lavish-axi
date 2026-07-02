@@ -674,6 +674,26 @@ test("artifact SDK audits layout after fonts and ResizeObserver settle", () => {
   assert.match(js, /element-scroll-overflow/);
   assert.match(js, /element-parent-overflow/);
   assert.match(js, /clipped-text/);
+  assert.match(js, /overlapping-text/);
+});
+
+test("artifact SDK dedups cascading visible-overflow spills to the innermost element", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /function resolveSpillCandidates/);
+  assert.match(js, /function resolveVisibleSpillCandidates/);
+  assert.match(js, /spillBottom/);
+  assert.match(js, /candidate\.el\.contains\(other\.el\)/);
+});
+
+test("artifact SDK uses per-fragment rects, not the bounding box, for overlap detection", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /function elementLineFragments/);
+  assert.match(js, /el\.getClientRects\(\)/);
+  assert.match(js, /fragmentsSignificantlyOverlap/);
+  assert.match(js, /function rectAreaOf\(rect\)/);
+  assert.match(js, /function intersectionAreaOf\(a, b\)/);
 });
 
 test("artifact SDK reports its scroll position and restores it on request", () => {
@@ -937,6 +957,7 @@ test("layout warnings wake the same long-poll feedback channel as human prompts"
           overflowPx: 12,
           viewportWidth: 720,
           severity: "error",
+          persistent: false,
         },
       ],
     });
