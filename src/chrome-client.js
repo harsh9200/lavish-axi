@@ -22,6 +22,16 @@ const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("c
 const sendButton = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
 const sendAndEndButton = /** @type {HTMLButtonElement} */ (document.getElementById("sendAndEnd"));
 const annotationSwitch = /** @type {HTMLButtonElement} */ (document.getElementById("annotation"));
+const annotationLabel = /** @type {HTMLSpanElement} */ (document.getElementById("annotationLabel"));
+const artifactVersionSelect = /** @type {HTMLSelectElement} */ (document.getElementById("artifactVersion"));
+const versionNotice = /** @type {HTMLDivElement} */ (document.getElementById("versionNotice"));
+const versionNoticeText = /** @type {HTMLSpanElement} */ (document.getElementById("versionNoticeText"));
+const viewVersionChangesButton = /** @type {HTMLButtonElement} */ (document.getElementById("viewVersionChanges"));
+const returnToCurrentButton = /** @type {HTMLButtonElement} */ (document.getElementById("returnToCurrent"));
+const versionDiff = /** @type {HTMLDivElement} */ (document.getElementById("versionDiff"));
+const versionDiffTitle = /** @type {HTMLHeadingElement} */ (document.getElementById("versionDiffTitle"));
+const versionDiffBody = /** @type {HTMLDivElement} */ (document.getElementById("versionDiffBody"));
+const closeVersionDiffButton = /** @type {HTMLButtonElement} */ (document.getElementById("closeVersionDiff"));
 const moreWrap = /** @type {HTMLDivElement} */ (document.getElementById("moreWrap"));
 const moreButton = /** @type {HTMLButtonElement} */ (document.getElementById("moreButton"));
 const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMenu"));
@@ -61,6 +71,9 @@ const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-arti
 
 const queued = loadQueuedPrompts();
 let annotation = true;
+let annotationBeforeHistory = true;
+let artifactVersions = [];
+let viewedVersionId = "";
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";
@@ -151,7 +164,7 @@ function render() {
 }
 
 function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
+  sendButton.disabled = ended;
   sendAndEndButton.disabled = sendButton.disabled;
 }
 
@@ -233,7 +246,13 @@ function syncChat(chat) {
 function setAgentPresence(state) {
   agentPresence = state === "listening" || state === "working" ? state : "waiting";
   updateSendState();
-  if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
+  if (presenceBanner) {
+    presenceBanner.hidden = ended || agentPresence === "listening";
+    presenceBanner.textContent =
+      agentPresence === "working"
+        ? "Your agent is working. New messages stay queued for the next poll."
+        : "Your agent is not listening. Messages stay queued until one poll attaches.";
+  }
 
   if (agentPresence !== "working") {
     if (workingBubble) workingBubble.remove();
@@ -248,6 +267,113 @@ function setAgentPresence(state) {
     chatLog.appendChild(workingBubble);
   }
   scrollElementIntoView(workingBubble);
+}
+
+function versionDisplayName(version, current = false) {
+  const round = `Round ${Number(version?.number) || 1}`;
+  const label = String(version?.label || "").trim();
+  return `${current ? "Current · " : ""}${round}${label ? ` · ${label}` : ""}`;
+}
+
+async function refreshVersions() {
+  const response = await fetch("/api/" + key + "/versions", { cache: "no-store" });
+  if (!response.ok) return;
+  const body = await response.json();
+  artifactVersions = Array.isArray(body.versions) ? body.versions : [];
+  const latest = artifactVersions.at(-1);
+  const options = [];
+  const currentOption = document.createElement("option");
+  currentOption.value = "";
+  currentOption.textContent = latest ? versionDisplayName(latest, true) : "Current";
+  options.push(currentOption);
+  for (const version of [...artifactVersions].reverse()) {
+    const option = document.createElement("option");
+    option.value = String(version.id || "");
+    option.textContent = `${versionDisplayName(version)}${version.id === latest?.id ? " · Saved" : ""}`;
+    options.push(option);
+  }
+  artifactVersionSelect.replaceChildren(...options);
+  if (viewedVersionId && artifactVersions.some((version) => version.id === viewedVersionId)) {
+    artifactVersionSelect.value = viewedVersionId;
+    updateVersionNotice();
+  } else if (viewedVersionId) {
+    showVersion("");
+  }
+}
+
+function updateVersionNotice() {
+  const version = artifactVersions.find((item) => item.id === viewedVersionId);
+  versionNotice.hidden = !version;
+  if (version) versionNoticeText.textContent = `${versionDisplayName(version)} · Read-only history`;
+}
+
+function setChromeAnnotationMode(enabled, notifyFrame = true) {
+  annotation = Boolean(enabled);
+  annotationSwitch.setAttribute("aria-pressed", String(annotation));
+  annotationLabel.textContent = annotation ? "Annotate" : "Explore";
+  annotationSwitch.title = annotation
+    ? `Annotations on · press ⌘${MODE_TOGGLE_HOTKEY_KEY.toUpperCase()} / Ctrl+${MODE_TOGGLE_HOTKEY_KEY.toUpperCase()} to explore`
+    : `Explore mode · annotations hidden · press ⌘${MODE_TOGGLE_HOTKEY_KEY.toUpperCase()} / Ctrl+${MODE_TOGGLE_HOTKEY_KEY.toUpperCase()} to annotate`;
+  if (notifyFrame) {
+    postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !viewedVersionId });
+  }
+}
+
+async function showVersion(id) {
+  const nextId = String(id || "");
+  if (nextId === viewedVersionId) return;
+  closeWhiteboard();
+  versionDiff.hidden = true;
+  if (nextId) {
+    annotationBeforeHistory = annotation;
+    viewedVersionId = nextId;
+    setChromeAnnotationMode(false);
+    annotationSwitch.disabled = true;
+    revealLayoutGate();
+    setLayoutIssueBanner(false);
+    const url = new URL(artifactSrc, location.origin);
+    url.searchParams.set("version", nextId);
+    frame.src = url.pathname + url.search;
+  } else {
+    viewedVersionId = "";
+    annotationSwitch.disabled = ended;
+    setChromeAnnotationMode(annotationBeforeHistory);
+    startLayoutGateCycle();
+    frame.src = artifactSrc;
+  }
+  artifactVersionSelect.value = viewedVersionId;
+  updateVersionNotice();
+}
+
+async function showVersionDiff() {
+  if (!viewedVersionId) return;
+  versionDiff.hidden = false;
+  versionDiffTitle.textContent = "Loading changes";
+  versionDiffBody.innerHTML = '<div class="version-diff-empty">Comparing saved rounds...</div>';
+  const response = await fetch(`/api/${key}/versions/${encodeURIComponent(viewedVersionId)}/diff`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    versionDiffTitle.textContent = "Changes unavailable";
+    versionDiffBody.innerHTML = '<div class="version-diff-empty">Lavish could not read this saved diff.</div>';
+    return;
+  }
+  const diff = await response.json();
+  versionDiffTitle.textContent = diff.base
+    ? `${versionDisplayName(diff.base)} → ${versionDisplayName(diff.current)}`
+    : versionDisplayName(diff.current);
+  const changes = Array.isArray(diff.changes) ? diff.changes : [];
+  versionDiffBody.innerHTML = changes.length
+    ? changes
+        .map(
+          (change) =>
+            `<div class="version-diff-line ${change.type === "removed" ? "removed" : "added"}">${
+              change.type === "removed" ? "Removed · " : "Added · "
+            }${escapeHtml(change.text || "")}</div>`,
+        )
+        .join("") +
+      (diff.truncated ? '<div class="version-diff-empty">More changes are stored than shown here.</div>' : "")
+    : `<div class="version-diff-empty">${diff.base ? "No visible text changed in this round." : "This is the first saved round."}</div>`;
 }
 
 function scrollPanelToBottom() {
@@ -305,7 +431,7 @@ function requestSnapshot(action) {
 }
 
 function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
+  if (ended) return;
   closeMenus();
 
   const text = chatInput.value.trim();
@@ -1158,6 +1284,10 @@ function loadFrame() {
 
 function reloadArtifact() {
   closeMenus();
+  if (viewedVersionId) {
+    showVersion("");
+    return;
+  }
   resetFrame().then((reloaded) => {
     if (reloaded) refreshWhiteboardSource();
   });
@@ -1223,13 +1353,17 @@ window.addEventListener("message", (event) => {
 loadFrame();
 
 function toggleAnnotationMode() {
-  if (ended) return;
-  annotation = !annotation;
-  annotationSwitch.setAttribute("aria-pressed", String(annotation));
-  postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation });
+  if (ended || viewedVersionId) return;
+  setChromeAnnotationMode(!annotation);
 }
 
 annotationSwitch.onclick = toggleAnnotationMode;
+artifactVersionSelect.onchange = () => showVersion(artifactVersionSelect.value);
+viewVersionChangesButton.onclick = showVersionDiff;
+returnToCurrentButton.onclick = () => showVersion("");
+closeVersionDiffButton.onclick = () => {
+  versionDiff.hidden = true;
+};
 
 sendButton.onclick = () => sendQueued(false);
 sendAndEndButton.onclick = () => sendQueued(true);
@@ -1286,7 +1420,7 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
-  postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
+  postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended && !viewedVersionId });
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (overlayIndex !== null) {
@@ -1299,6 +1433,10 @@ initializeLayoutGate();
 
 const events = new EventSource("/events/" + key);
 events.addEventListener("reload", () => {
+  if (viewedVersionId) {
+    refreshVersions();
+    return;
+  }
   resetFrame().then((reloaded) => {
     if (reloaded) refreshWhiteboardSource();
   });
@@ -1307,7 +1445,10 @@ events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
 events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
 events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
 events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
+events.addEventListener("versions", refreshVersions);
 
 render();
 initialChat.forEach((item) => addChat(item.role, item.text));
 setAgentPresence("waiting");
+setChromeAnnotationMode(true, false);
+refreshVersions();

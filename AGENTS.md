@@ -74,11 +74,13 @@ State lives at `~/.lavish-axi/state.json` (`LAVISH_AXI_STATE_DIR`), shared acros
    Composer and annotation-card keyboard conventions, button layout, and the conversation panel are user-facing behavior owned by README's Feedback controls and Keyboard shortcuts bullets.
 7. `lavish-axi poll <file.html>` (`pollCommand`) hits `GET /api/poll`.
    Queued prompts or proven severe layout failures - including prompts queued before an ended session - are returned immediately and mark the session as observed by an agent; otherwise the poll marks the session actively listening and long-polls on an `EventEmitter` until a `feedback` or `ended` event fires.
+   A board admits exactly one poll: a duplicate gets an immediate structured 409 without adding listeners or disturbing the attached poll. Listener cleanup belongs to the response `close` event (a GET request can finish reading before its long-poll response ends), and the post-attach durable-queue recheck must leave an empty poll attached rather than cleaning it up.
+   Prompts queued with no attached poll persist `feedback_listener_gap`; the next delivery clears it and surfaces `listener_gap` so the CLI can warn that it recovered feedback from a gap.
    Every returned layout failure requires a fix-and-recheck loop before human review, including persistent failures, because lower-confidence observations never enter this path.
    A `status: "ended"` response carries `ended_by`; the final `status: "feedback"` batch delivered right before a session ends carries the same signal via `session_ended: true` plus `ended_by`, so that last `next_step` also skips the reopen instruction.
    Default no-timeout polls stream whitespace heartbeat bytes before the final JSON response and write waiting banners to stderr, keeping stdout reserved for the final JSON/TOON response; `--timeout-ms` is a non-streaming test/debug escape hatch.
    If SIGINT or SIGTERM interrupts a no-timeout poll, the CLI writes re-run guidance to stderr and exits with the conventional signal code; queued feedback persists, so re-running the same poll is safe.
-8. The `/events/:key` SSE stream emits `agent-presence` states: `waiting` before any poll has attached, `listening` while one is active, and `working` after a poll has delivered feedback and released; the chrome allows queued feedback while waiting or listening and blocks sends only while working.
+8. The `/events/:key` SSE stream emits `agent-presence` states: `waiting` before any poll has attached, `listening` while one is active, and `working` after a poll has delivered feedback and released; the chrome keeps Send usable in all open-session states and explains that messages sent while waiting or working remain queued for the next poll.
    `--agent-reply` posts a chat message into the session before polling, rendered in the browser conversation panel via the same stream.
 
 ### Live reload
@@ -89,6 +91,11 @@ Any file change emits a `reload` SSE event and the chrome reloads the iframe; th
 During version-driven shutdown, the server sends a `chrome-reload` SSE event so open browser chromes wait for the replacement server and then reload the whole chrome page.
 Hand-edited files in `dist/` won't trigger reloads.
 Run `lavish-axi server --verbose` (or set `LAVISH_AXI_DEBUG=1`) to log session and watcher events to stderr when diagnosing wedges; detached server stdout/stderr is also appended to `server.log` in `LAVISH_AXI_STATE_DIR` for startup and crash diagnostics.
+
+### Artifact versions
+
+`src/version-store.js` snapshots distinct artifact HTML into `<state-dir>/versions/<session-key>/` with an atomic manifest, serialized per key so watcher and explicit CLI snapshots cannot race. Hash dedupe preserves one stable path-keyed session URL; `lavish-axi snapshot` may label the latest identical round without creating a phantom version.
+Historical HTML is served read-only from the normal artifact index route with a `version` query so relative sibling assets still resolve, while current HTML keeps the annotation SDK. The chrome's Round picker disables annotation for history, and its bounded visible-text diff intentionally excludes scripts, styles, templates, and hidden content.
 
 ### Whiteboard (Mermaid → Excalidraw)
 

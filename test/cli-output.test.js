@@ -26,6 +26,7 @@ import {
   createPlaybookOutput,
   createServerSpawnOptions,
   createShareOutput,
+  createSnapshotOutput,
   createUserEndedOpenOutput,
   detectInvokingAgent,
   fetchJson,
@@ -57,6 +58,9 @@ function setupHooksEnv(homeDir, stateDir) {
 }
 
 function assertObservablePollWakePath(text) {
+  assert.match(text, /poll is one-shot/i);
+  assert.match(text, /exactly one poll attached per board/i);
+  assert.match(text, /duplicate poll is refused immediately/i);
   assert.match(text, /Keep the poll in the foreground by default/i);
   assert.match(text, /return the feedback directly to the agent/i);
   assert.match(text, /harness-native tracked background-job facility/i);
@@ -75,6 +79,29 @@ function assertObservablePollWakePath(text) {
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(VERSION, packageJson.version);
+});
+
+test("snapshot output reports a stable review round and dedupe status", () => {
+  assert.deepEqual(
+    createSnapshotOutput({
+      file: "/tmp/board.html",
+      response: {
+        status: "created",
+        version: { id: "v0003", number: 3, created_at: "2026-07-16T00:00:00.000Z", label: "Captain review" },
+      },
+    }),
+    {
+      snapshot: {
+        file: "/tmp/board.html",
+        id: "v0003",
+        round: 3,
+        created_at: "2026-07-16T00:00:00.000Z",
+        status: "created",
+        label: "Captain review",
+      },
+      next_step: "Saved a new review round behind the board's existing Lavish session URL.",
+    },
+  );
 });
 
 test("home output teaches agents when and how to use Lavish Editor", () => {
@@ -1023,6 +1050,23 @@ test("feedback next step keeps the next poll completion observable", () => {
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
 });
 
+test("feedback recovered after a listener gap loudly tells the agent what happened", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      listener_gap: true,
+      prompts: [{ prompt: "Message from the gap", tag: "message" }],
+    },
+  });
+
+  assert.deepEqual(output.warnings, [
+    "This feedback arrived while no poll was attached. Lavish recovered it from the durable queue; keep exactly one poll attached to this board and re-arm it after every delivery.",
+  ]);
+  assert.match(output.next_step, /recovered it from the durable queue/);
+  assert.match(output.next_step, /exactly one poll attached/);
+});
+
 test("feedback next step is Codex-aware when requested", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
@@ -1414,6 +1458,12 @@ test("html file arguments normalize to the hidden open command", () => {
   assert.deepEqual(normalizeArgv(["--no-open", "report.html"]), ["open", "--no-open", "report.html"]);
   assert.deepEqual(normalizeArgv(["--no-gate", "report.html"]), ["open", "--no-gate", "report.html"]);
   assert.deepEqual(normalizeArgv(["poll", "report.html"]), ["poll", "report.html"]);
+  assert.deepEqual(normalizeArgv(["snapshot", "report.html", "--label", "Round one"]), [
+    "snapshot",
+    "report.html",
+    "--label",
+    "Round one",
+  ]);
   assert.deepEqual(normalizeArgv(["setup", "hooks"]), ["setup", "hooks"]);
   assert.deepEqual(normalizeArgv(["playbook", "diagram"]), ["playbook", "diagram"]);
   assert.deepEqual(normalizeArgv(["design"]), ["design"]);
