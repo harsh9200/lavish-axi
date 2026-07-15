@@ -40,6 +40,7 @@ import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, hostForUrl, linkHost } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
+import { ArtifactVersionStore } from "./version-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
@@ -127,6 +128,7 @@ export async function serve({
 }) {
   const app = express();
   const store = new SessionStore(stateFile);
+  const versionStore = new ArtifactVersionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
   const activePolls = new Map();
@@ -181,11 +183,12 @@ export async function serve({
       const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
+      await versionStore.snapshot(session, { trigger: "open" });
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       }
       logEvent?.(`session opened key=${key} file=${file}`);
-      await watchSession(session, watchers, events, logEvent);
+      await watchSession(session, watchers, events, versionStore, logEvent);
       res.json({ key, file, url, status: "opened" });
     } catch (error) {
       next(error);
@@ -198,10 +201,12 @@ export async function serve({
       const key = sessionKey(file);
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
-      const immediate = await store.takeFeedback(key);
-      if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-        res.json(immediate);
+      if (activePolls.has(key)) {
+        res.status(409).json({
+          error:
+            "A poll is already attached to this board. Keep exactly one poll per board; reuse the existing listener.",
+          status: "duplicate-poll",
+        });
         return;
       }
       const streamHeartbeat = timeoutMs === null;
@@ -214,11 +219,11 @@ export async function serve({
         }, pollHeartbeatMs);
         heartbeat.unref?.();
       }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
-      refreshIdleTimer();
-      const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
+      let timer = null;
       let cleaned = false;
       let responding = false;
+      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      refreshIdleTimer();
       const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
@@ -229,11 +234,15 @@ export async function serve({
         setPollActive(key, activePolls, deliveredFeedback, events, false);
         refreshIdleTimer();
       };
-      const respond = async () => {
+      const respond = async ({ onlyIfReady = false } = {}) => {
         if (responding || res.writableEnded) return;
         responding = true;
         try {
           const result = await store.takeFeedback(key);
+          if (onlyIfReady && result.status === "waiting") {
+            responding = false;
+            return;
+          }
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
@@ -241,7 +250,9 @@ export async function serve({
             res.json(result);
           }
         } finally {
-          cleanup();
+          // A readiness probe that found no durable feedback leaves the poll attached. Every
+          // actual response (and every error) keeps `responding` true and releases it here.
+          if (responding) cleanup();
         }
       };
       function handleRespondError(error) {
@@ -260,7 +271,15 @@ export async function serve({
       };
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
-      req.on("close", cleanup);
+      // The request side of a GET can close as soon as its empty body is fully read. The
+      // long-poll lives on the response side, so only release its listener when that response
+      // finishes or its client connection actually closes.
+      res.on("close", cleanup);
+      timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
+      // Register the listener before this durable-queue check. A prompt posted in the tiny
+      // attach window either wakes the listener or is recovered here, so chat can never advance
+      // without the corresponding prompt reaching this poll.
+      await respond({ onlyIfReady: true });
     } catch (error) {
       next(error);
     }
@@ -269,7 +288,9 @@ export async function serve({
   app.post("/api/:key/prompts", async (req, res, next) => {
     try {
       const shouldEndSession = Boolean(req.body?.endSession || req.body?.end_session);
-      const session = await store.queuePrompts(req.params.key, req.body || {});
+      const session = await store.queuePrompts(req.params.key, req.body || {}, {
+        listenerAttached: activePolls.has(req.params.key),
+      });
       if (!session) {
         res.status(404).json({ error: "session not found" });
         return;
@@ -322,6 +343,47 @@ export async function serve({
       events.emit("agent-reply", req.params.key, text);
       clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       res.json({ status: "sent" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/versions", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({ versions: await versionStore.list(req.params.key) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/versions", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const result = await versionStore.snapshot(session, { label: req.body?.label, trigger: "explicit" });
+      if (result.created || req.body?.label) events.emit("versions", req.params.key);
+      res.json({ status: result.created ? "created" : "unchanged", version: result.version });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/versions/:id/diff", async (req, res, next) => {
+    try {
+      const result = await versionStore.diff(req.params.key, req.params.id, optionalBodyString(req.query.base));
+      if (!result) {
+        res.status(404).json({ error: "version not found" });
+        return;
+      }
+      res.json(result);
     } catch (error) {
       next(error);
     }
@@ -420,7 +482,7 @@ export async function serve({
         res.status(404).send("Session not found");
         return;
       }
-      await watchSession(session, watchers, events, logEvent);
+      await watchSession(session, watchers, events, versionStore, logEvent);
       const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
       res.type("html").send(
@@ -445,6 +507,17 @@ export async function serve({
       const session = await store.findByKey(key);
       if (!session) {
         res.status(404).send("Session not found");
+        return;
+      }
+      const requestedVersion = String(req.query.version || "");
+      if (requestedVersion) {
+        const html = await versionStore.readVersion(key, requestedVersion);
+        if (html === null) {
+          res.status(404).send("Version not found");
+          return;
+        }
+        res.setHeader("cache-control", "no-store");
+        res.type("html").send(html);
         return;
       }
       const html = await readFile(session.file, "utf8");
@@ -500,6 +573,9 @@ export async function serve({
           res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
         }
       };
+      const sendVersions = (key) => {
+        if (key === req.params.key) res.write("event: versions\ndata: {}\n\n");
+      };
       res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
       res.write(
         `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
@@ -507,11 +583,13 @@ export async function serve({
       events.on("reload", sendReload);
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
+      events.on("versions", sendVersions);
       req.on("close", () => {
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
+        events.off("versions", sendVersions);
         refreshIdleTimer();
       });
     } catch (error) {
@@ -795,6 +873,11 @@ export async function serve({
 
   return {
     port: httpServer.address().port,
+    inspectPollListeners: (key) => ({
+      active: activePolls.has(key),
+      feedback: events.listenerCount("feedback"),
+      ended: events.listenerCount("ended"),
+    }),
     close: async () => {
       shutdown();
       await done;
@@ -881,7 +964,7 @@ export function resolveArtifactAsset(root, assetPath) {
   return file;
 }
 
-async function watchSession(session, watchers, events, logEvent) {
+async function watchSession(session, watchers, events, versionStore, logEvent) {
   if (watchers.has(session.key)) {
     return;
   }
@@ -895,7 +978,17 @@ async function watchSession(session, watchers, events, logEvent) {
   watcher.on("all", (event, file) => {
     logEvent?.(`watch event=${event} session=${session.key} file=${file ?? ""}`);
     clearTimeout(timer);
-    timer = setTimeout(() => events.emit("reload", session.key), 100);
+    timer = setTimeout(async () => {
+      try {
+        const result = await versionStore.snapshot(session, { trigger: "change" });
+        if (result.created) events.emit("versions", session.key);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logEvent?.(`version snapshot error session=${session.key} message=${message}`);
+      } finally {
+        events.emit("reload", session.key);
+      }
+    }, 100);
   });
   watcher.on("error", (error) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -1139,8 +1232,8 @@ ${faviconTag}
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface has a severe layout failure. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="version-control"><label for="artifactVersion">Round</label><select id="artifactVersion" title="View a saved review round"><option value="">Current</option></select></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span id="annotationLabel">Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="version-notice" id="versionNotice" hidden><span id="versionNoticeText"></span><div class="version-notice-actions"><button id="viewVersionChanges" type="button">Changes</button><button id="returnToCurrent" type="button">Return to current</button></div></div><div class="version-diff" id="versionDiff" hidden><div class="version-diff-head"><div><div class="version-diff-kicker">Visible text diff</div><h2 id="versionDiffTitle">Changes</h2></div><button id="closeVersionDiff" type="button" aria-label="Close version diff"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="version-diff-body" id="versionDiffBody"></div></div><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface has a severe layout failure. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>

@@ -43,6 +43,7 @@ export class SessionStore {
       layout_warnings: [],
       delivered_layout_warning_keys: existing.delivered_layout_warning_keys || [],
       dom_snapshot: existing.dom_snapshot || "",
+      feedback_listener_gap: Boolean(existing.feedback_listener_gap),
       chat: existing.chat || [],
       updated_at: new Date().toISOString(),
     };
@@ -51,7 +52,7 @@ export class SessionStore {
     return session;
   }
 
-  async queuePrompts(key, payload) {
+  async queuePrompts(key, payload, { listenerAttached = true } = {}) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -65,6 +66,7 @@ export class SessionStore {
       .filter((prompt) => prompt.tag === "message" && prompt.prompt)
       .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
     session.prompts = [...(session.prompts || []), ...normalizedPrompts];
+    if (normalizedPrompts.length > 0 && !listenerAttached) session.feedback_listener_gap = true;
     session.chat = [...(session.chat || []), ...userMessages];
     session.pending_prompts = session.prompts.length;
     session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
@@ -128,6 +130,7 @@ export class SessionStore {
       status: "feedback",
       dom_snapshot: session.dom_snapshot || "",
       prompts,
+      ...(session.feedback_listener_gap ? { listener_gap: true } : {}),
       ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
       // This is the final delivery before the session shows as ended - flag it so the agent
       // knows not to expect (or force) a reopened browser afterward.
@@ -137,6 +140,7 @@ export class SessionStore {
     session.layout_warnings = [];
     session.pending_prompts = 0;
     session.dom_snapshot = "";
+    session.feedback_listener_gap = false;
     if (layoutWarnings.length > 0) {
       const deliveredKeys = new Set(session.delivered_layout_warning_keys || []);
       for (const warning of layoutWarnings) deliveredKeys.add(layoutWarningKey(warning));

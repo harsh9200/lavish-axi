@@ -10,7 +10,7 @@ const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
 const defaultSessionData = { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" };
 
 async function createChromeHarness({
-  fetchImpl = async () => ({ ok: true }),
+  fetchImpl = async (_url, _init) => ({ ok: true }),
   sessionData = defaultSessionData,
   artifactSrc = "",
 } = {}) {
@@ -108,6 +108,11 @@ async function createChromeHarness({
         this.lastAppendedChild = child;
         return child;
       },
+      replaceChildren(...children) {
+        for (const child of children) child.parentElement = this;
+        this.children = children;
+        this.lastAppendedChild = children.at(-1) || null;
+      },
       click(event = {}) {
         this.clicked = true;
         if (typeof this.onclick === "function") return this.onclick(event);
@@ -154,7 +159,12 @@ async function createChromeHarness({
   const context = {
     clearTimeout: fakeClearTimeout,
     console,
-    fetch: fetchImpl,
+    fetch(url, init) {
+      if (url === `/api/${sessionData.key}/versions`) {
+        return Promise.resolve({ ok: true, json: async () => ({ versions: [] }) });
+      }
+      return fetchImpl(url, init);
+    },
     location: {
       reload() {
         reloadCount += 1;
@@ -919,7 +929,7 @@ test("plain 'i' and other modifier combos do not toggle annotation mode", async 
 
   const bareEvent = chrome.dispatchDocumentKeydown({ key: "i" });
   assert.equal(bareEvent.defaultPrevented, false);
-  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
 
   const shiftEvent = chrome.dispatchDocumentKeydown({ key: "i", shiftKey: true });
   assert.equal(shiftEvent.defaultPrevented, false);
@@ -943,7 +953,7 @@ test("chrome client reads the mode toggle hotkey from the session bootstrap", as
 
   const oldHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
   assert.equal(oldHotkeyEvent.defaultPrevented, false);
-  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
 
   const bootstrapHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "K", metaKey: true });
   assert.equal(bootstrapHotkeyEvent.defaultPrevented, true);

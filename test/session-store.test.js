@@ -8,7 +8,7 @@ import { SessionStore } from "../src/session-store.js";
 
 function feedbackResult(result) {
   assert.equal(result.status, "feedback");
-  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], layout_warnings?: any[], session_ended?: boolean, ended_by?: string }} */ (
+  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], layout_warnings?: any[], listener_gap?: boolean, session_ended?: boolean, ended_by?: string }} */ (
     result
   );
 }
@@ -35,6 +35,29 @@ test("queued prompts are returned with DOM snapshot context and then cleared", a
 
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("feedback queued without a listener carries a durable gap warning exactly once", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(path.join(dir, "state.json"));
+    const { key } = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(
+      key,
+      { prompts: [{ prompt: "Message during the gap", tag: "message" }] },
+      { listenerAttached: false },
+    );
+    const first = feedbackResult(await store.takeFeedback(key));
+    assert.equal(first.listener_gap, true);
+    assert.equal(first.prompts[0].prompt, "Message during the gap");
+    const second = await store.takeFeedback(key);
+    assert.equal(second.status, "waiting");
+    assert.equal("listener_gap" in second, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

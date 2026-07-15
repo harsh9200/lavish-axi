@@ -266,6 +266,36 @@ test("the annotate switch exposes the mode toggle hotkey as a discoverable toolt
   assert.match(html, /id="annotation"[^>]*title="Toggle annotate\/explore mode \(⌘I \/ Ctrl\+I\)"/);
 });
 
+test("chrome exposes stable review rounds with an unmistakable read-only history state", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const js = await chromeClientSource();
+  const css = await chromeCssSource();
+
+  assert.match(html, /<select id="artifactVersion"[^>]*><option value="">Current<\/option>/);
+  assert.match(html, /id="versionNotice" hidden/);
+  assert.match(html, /id="viewVersionChanges"[^>]*>Changes<\/button>/);
+  assert.match(html, /id="returnToCurrent"[^>]*>Return to current<\/button>/);
+  assert.match(js, /\/api\/" \+ key \+ "\/versions"/);
+  assert.match(js, /Read-only history/);
+  assert.match(js, /url\.searchParams\.set\("version", nextId\)/);
+  assert.doesNotMatch(js, /if \(version\.id === latest\?\.id\) continue/);
+  assert.match(js, /version\.id === latest\?\.id \? " · Saved"/);
+  assert.match(js, /annotationSwitch\.disabled = true/);
+  assert.match(js, /Visible text diff|showVersionDiff/);
+  assert.match(css, /\.version-notice\{/);
+  assert.match(css, /\.version-diff-line\.added\{/);
+  assert.match(css, /\.version-diff-line\.removed\{/);
+});
+
+test("annotation mode names the explore state and keeps the cross-frame keyboard shortcut", async () => {
+  const js = await chromeClientSource();
+
+  assert.match(js, /annotationLabel\.textContent = annotation \? "Annotate" : "Explore"/);
+  assert.match(js, /Explore mode · annotations hidden/);
+  assert.match(js, /setChromeAnnotationMode\(!annotation\)/);
+  assert.match(js, /postToFrame\(\{ type: "lavish:setAnnotationMode", enabled: annotation && !viewedVersionId \}\)/);
+});
+
 test("artifact SDK lets marked feedback controls handle their own clicks", () => {
   const js = createSdkJs("abc");
 
@@ -612,12 +642,14 @@ test("chrome shows agent working state when a previous poll has released", async
   assert.match(js, /spinner/);
 });
 
-test("chrome disables sending only while working or ended", async () => {
+test("chrome keeps sending usable while working and disables it only after session end", async () => {
   const js = await chromeClientSource();
 
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
+  assert.match(js, /sendButton\.disabled = ended;/);
+  assert.doesNotMatch(js, /if \(ended \|\| agentPresence === "working"\) return/);
+  assert.match(js, /New messages stay queued for the next poll/);
   assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
   assert.doesNotMatch(js, /hasContent/);
 });
@@ -670,14 +702,16 @@ test("chrome only marks session ended after the end request succeeds", async () 
   assert.match(js, /if \(!response\.ok\) throw new Error\("failed to end session"\);\n {2}markSessionEnded\(\)/);
 });
 
-test("chrome shows a waiting banner when no agent has attached", async () => {
+test("chrome explains both waiting and working listener states", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const js = await chromeClientSource();
   const css = await chromeCssSource();
 
   assert.match(html, /id="presenceBanner"/);
   assert.match(html, /Your agent is not listening/);
-  assert.match(js, /presenceBanner\.hidden = ended \|\| agentPresence !== "waiting"/);
+  assert.match(js, /presenceBanner\.hidden = ended \|\| agentPresence === "listening"/);
+  assert.match(js, /Messages stay queued until one poll attaches/);
+  assert.match(js, /New messages stay queued for the next poll/);
   assert.match(css, /\.presence-banner\{/);
 });
 
@@ -2058,12 +2092,109 @@ test("SSE agent-presence returns to waiting after an agent reply so sending is e
       assert.equal(sendDisabled, false, "waiting presence must leave Send enabled for an open session");
       assert.match(
         await chromeClientSource(),
-        /sendButton\.disabled = ended \|\| agentPresence === "working"/,
-        "the chrome must disable Send only for working or ended sessions",
+        /sendButton\.disabled = ended;/,
+        "working presence must keep Send usable so new messages queue for the next poll",
       );
     } finally {
       await presence.close();
     }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("server refuses a duplicate poll for the same board without attaching another listener", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-poll-guard-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  let firstTimeout;
+  let duplicateTimeout;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    const presence = await startPresenceStream(base, opened.key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+      const firstController = new AbortController();
+      firstTimeout = setTimeout(() => firstController.abort(), 2000);
+      const first = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=5000`, {
+        signal: firstController.signal,
+      }).then((response) => response.json());
+      first.catch(() => {});
+      assert.equal(await presence.next(), "listening");
+      const listenersBeforeDuplicate = server.inspectPollListeners(opened.key);
+      assert.deepEqual(listenersBeforeDuplicate, { active: true, feedback: 1, ended: 1 });
+
+      const duplicateController = new AbortController();
+      duplicateTimeout = setTimeout(() => duplicateController.abort(), 250);
+      const duplicate = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`, {
+        signal: duplicateController.signal,
+      });
+      clearTimeout(duplicateTimeout);
+      assert.equal(duplicate.status, 409);
+      assert.deepEqual(await duplicate.json(), {
+        error:
+          "A poll is already attached to this board. Keep exactly one poll per board; reuse the existing listener.",
+        status: "duplicate-poll",
+      });
+      assert.deepEqual(
+        server.inspectPollListeners(opened.key),
+        listenersBeforeDuplicate,
+        "refusing poll B must not add EventEmitter listeners or disturb poll A",
+      );
+
+      await fetch(`${base}/api/${opened.key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "Resolve poll A", tag: "message" }] }),
+      });
+      const feedback = await first;
+      clearTimeout(firstTimeout);
+      assert.equal(feedback.status, "feedback");
+      assert.equal(feedback.prompts[0].prompt, "Resolve poll A");
+      assert.equal(await presence.next(), "working");
+      assert.deepEqual(server.inspectPollListeners(opened.key), { active: false, feedback: 0, ended: 0 });
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    clearTimeout(firstTimeout);
+    clearTimeout(duplicateTimeout);
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a message sent before poll attachment is recovered with a listener-gap warning", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-poll-gap-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    await fetch(`${base}/api/${opened.key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "Do not lose this", tag: "message" }] }),
+    });
+
+    const feedback = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=1000`).then(
+      (response) => response.json(),
+    );
+    assert.equal(feedback.status, "feedback");
+    assert.equal(feedback.listener_gap, true);
+    assert.equal(feedback.prompts[0].prompt, "Do not lose this");
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -2210,7 +2341,7 @@ test("long-poll response cleanup is guarded against storage failures", async () 
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
   assert.match(source, /try \{\s*const result = await store\.takeFeedback\(key\)/);
-  assert.match(source, /finally \{\s*cleanup\(\);\s*\}/);
+  assert.match(source, /finally \{[\s\S]*if \(responding\) cleanup\(\);\s*\}/);
 });
 
 test("heartbeat long-poll errors close the stream without Express error handling", async () => {
@@ -2286,6 +2417,7 @@ test("SSE agent-presence switches to working when poll immediately takes queued 
     });
     await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
 
+    assert.equal(await waitForPresence(), "listening");
     const working = await waitForPresence();
     assert.equal(working, "working");
 
@@ -2320,6 +2452,7 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
       await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      assert.equal(await presence.next(), "listening");
       assert.equal(await presence.next(), "working");
 
       await fetch(`${base}/api/${key}/end`, { method: "POST" });
@@ -2431,6 +2564,88 @@ test("resolveWatchTarget falls back to file-only when the artifact can't be read
     key: "abc",
   });
   assert.equal(target.scope, "file");
+});
+
+test("server snapshots the initial artifact and every distinct watched change behind the stable session URL", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-version-server-"));
+  const artifact = path.join(dir, "board.html");
+  await writeFile(artifact, "<!doctype html><html><body><h1>Round one</h1></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    const stableUrl = opened.url;
+    const initial = await fetch(`${base}/api/${opened.key}/versions`).then((response) => response.json());
+    assert.deepEqual(
+      initial.versions.map((version) => version.id),
+      ["v0001"],
+    );
+
+    await writeFile(artifact, "<!doctype html><html><body><h1>Round two</h1></body></html>");
+    let versions = initial.versions;
+    for (let attempt = 0; attempt < 30 && versions.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      versions = await fetch(`${base}/api/${opened.key}/versions`)
+        .then((response) => response.json())
+        .then((body) => body.versions);
+    }
+    assert.deepEqual(
+      versions.map((version) => version.id),
+      ["v0001", "v0002"],
+    );
+
+    const reopened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    assert.equal(reopened.url, stableUrl);
+    const afterReopen = await fetch(`${base}/api/${opened.key}/versions`).then((response) => response.json());
+    assert.equal(afterReopen.versions.length, 2, "reopening unchanged HTML must not create a phantom round");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("historical artifact routes are read-only and expose a visible-text diff", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-version-server-"));
+  const artifact = path.join(dir, "board.html");
+  await writeFile(artifact, "<!doctype html><html><body><p>Draft</p></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    await writeFile(artifact, "<!doctype html><html><body><p>Approved</p></body></html>");
+    await fetch(`${base}/api/${opened.key}/versions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label: "Captain approved" }),
+    });
+
+    const historical = await fetch(`${base}/artifact/${opened.key}/index.html?version=v0001`).then((response) =>
+      response.text(),
+    );
+    assert.match(historical, /Draft/);
+    assert.doesNotMatch(historical, /\/sdk\.js/);
+    const diff = await fetch(`${base}/api/${opened.key}/versions/v0002/diff`).then((response) => response.json());
+    assert.equal(diff.base.id, "v0001");
+    assert.deepEqual(diff.changes, [
+      { type: "added", text: "Approved" },
+      { type: "removed", text: "Draft" },
+    ]);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("concurrent same-session opens create only one file watcher", async () => {
