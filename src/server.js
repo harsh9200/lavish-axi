@@ -320,6 +320,7 @@ export async function serve({
         return;
       }
       events.emit("agent-reply", req.params.key, text);
+      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       res.json({ status: "sent" });
     } catch (error) {
       next(error);

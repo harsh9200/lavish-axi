@@ -2006,6 +2006,60 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
   }
 });
 
+test("SSE agent-presence returns to waiting after an agent reply so sending is enabled", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+
+      const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((res) => res.json());
+      assert.equal(await presence.next(), "listening");
+
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      const feedback = await poll;
+      assert.equal(feedback.status, "feedback");
+      assert.equal(await presence.next(), "working");
+
+      const reply = await fetch(`${base}/api/${key}/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "done" }),
+      });
+      assert.equal(reply.status, 200);
+
+      const afterReply = await presence.next();
+      const sendDisabled = afterReply === "working";
+      assert.equal(afterReply, "waiting");
+      assert.equal(sendDisabled, false, "waiting presence must leave Send enabled for an open session");
+      assert.match(
+        await chromeClientSource(),
+        /sendButton\.disabled = ended \|\| agentPresence === "working"/,
+        "the chrome must disable Send only for working or ended sessions",
+      );
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SSE handshake reports waiting on a fresh session that never had a poll", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
