@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Missing paint health fixture</title>
+    <script>
+      const originalGetEntriesByType = performance.getEntriesByType.bind(performance);
+      performance.getEntriesByType = (type) => (type === "paint" ? [] : originalGetEntriesByType(type));
+    </script>
+  </head>
+  <body>
+    <main><h1>Meaningful artifact content</h1></main>
+  </body>
+</html>

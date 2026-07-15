@@ -251,6 +251,11 @@ export function createArtifactSdk(
   isNativeInteractive = isNativeInteractiveControl,
   mermaid = mermaidHelpers,
 ) {
+  /** @type {Window & { __lavishArtifactHealth?: { markSdkStarted?: () => void, markSdkAttached?: () => void, markSdkReady?: () => void } }} */ (
+    window
+  ).__lavishArtifactHealth?.markSdkStarted?.();
+  parent.postMessage({ type: "lavish:artifactLifecycle", stage: "sdk-started" }, "*");
+
   const { isMermaidSvg, mermaidNodeFrom, mermaidNodeElement } = mermaid;
   let annotationMode = true;
   let hovered = null;
@@ -1538,6 +1543,10 @@ export function createArtifactSdk(
     setStatus: (message) => parent.postMessage({ type: "lavish:status", message: String(message) }, "*"),
     snapshot,
   };
+  /** @type {Window & { __lavishArtifactHealth?: { markSdkAttached?: () => void } }} */ (
+    window
+  ).__lavishArtifactHealth?.markSdkAttached?.();
+  parent.postMessage({ type: "lavish:artifactLifecycle", stage: "sdk-attached" }, "*");
 
   window.addEventListener("message", (event) => {
     const msg = event.data || {};
@@ -1665,4 +1674,9 @@ export function createArtifactSdk(
   }
   const mermaidObserver = new MutationObserver(() => scheduleMermaidEnhance());
   mermaidObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  /** @type {Window & { __lavishArtifactHealth?: { markSdkReady?: () => void } }} */ (
+    window
+  ).__lavishArtifactHealth?.markSdkReady?.();
+  parent.postMessage({ type: "lavish:artifactLifecycle", stage: "sdk-ready" }, "*");
 }
