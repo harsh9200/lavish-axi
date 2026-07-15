@@ -131,6 +131,16 @@ test("artifact SDK script is valid JavaScript", () => {
   assert.doesNotThrow(() => new Function(js));
 });
 
+test("artifact SDK reports startup and readiness to the injected health watchdog", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /__lavishArtifactHealth\?\.markSdkStarted\?\.\(\)/);
+  assert.match(js, /__lavishArtifactHealth\?\.markSdkAttached\?\.\(\)/);
+  assert.match(js, /__lavishArtifactHealth\?\.markSdkReady\?\.\(\)/);
+  assert.match(js, /type:\s*["']lavish:artifactLifecycle["']/);
+  assert.doesNotMatch(js, /localStorage|sessionStorage/);
+});
+
 test("artifact SDK ignores Lavish-owned annotation UI", () => {
   const js = createSdkJs("abc");
 

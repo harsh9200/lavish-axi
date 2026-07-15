@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const runBrowserE2e = process.env.LAVISH_AXI_BROWSER_E2E === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtures = path.join(repoRoot, "test/fixtures/layout-audit");
+const healthFixtures = path.join(repoRoot, "test/fixtures/artifact-health");
 
 function run(command, args, env, timeout = 45_000) {
   const result = spawnSync(command, args, {
@@ -65,6 +66,30 @@ test(
       return openArtifact(path.join(fixtures, `${name}.html`));
     }
 
+    function checkArtifactHealth(name, settleMs, expectedDiagnosis = "") {
+      const { url } = openArtifact(path.join(healthFixtures, `${name}.html`));
+      run("chrome-devtools-axi", ["open", url], chromeEnv);
+      run("chrome-devtools-axi", ["wait", String(settleMs)], chromeEnv, settleMs + 45_000);
+      const snapshot = run("chrome-devtools-axi", ["snapshot", "--full"], chromeEnv);
+      const chromeState = run(
+        "chrome-devtools-axi",
+        [
+          "eval",
+          '() => ({ diagnostic: document.body.innerText.includes("Lavish diagnostic"), gate: document.body.classList.contains("layout-gate-active") })',
+        ],
+        chromeEnv,
+      );
+
+      if (expectedDiagnosis) {
+        assert.match(snapshot, new RegExp(expectedDiagnosis), name);
+        assert.match(chromeState, /diagnostic.*true/, name);
+      } else {
+        assert.doesNotMatch(snapshot, /ARTIFACT DIAGNOSTICS|Lavish diagnostic/, name);
+        assert.match(chromeState, /diagnostic.*false/, name);
+      }
+      assert.match(chromeState, /gate.*false/, name);
+    }
+
     function audit(name, viewport, settleMs, expectedCount) {
       const { file, url } = openFixture(name);
       run("chrome-devtools-axi", ["emulate", "--viewport", viewport], chromeEnv);
@@ -100,6 +125,11 @@ test(
     }
 
     try {
+      checkArtifactHealth("sdk-blocked", 7000, "Lavish SDK was not fetched");
+      checkArtifactHealth("sdk-crashed", 1500, "Lavish SDK crashed during startup");
+      checkArtifactHealth("paint-missing", 5000, "Artifact content was not painted");
+      checkArtifactHealth("empty-sdk-blocked", 13_000);
+
       audit("control-broken-occlusion", "1440x1000x1", 3200, 1);
 
       const acceptable = [
